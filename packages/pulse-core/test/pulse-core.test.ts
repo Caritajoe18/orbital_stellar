@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EngineAlreadyStartedError } from "../src/errors.js";
 
 type StreamHandlers = {
   onmessage: (record: unknown) => void;
@@ -126,6 +127,37 @@ describe("pulse-core EventEngine", () => {
     engine.stop();
 
     expect(registry.size).toBe(0);
+  });
+
+  it("emits engine.stopped to all watchers before tearing them down", () => {
+    const engine = new EventEngine({ network: "testnet" });
+    const watcher = engine.subscribe("GABC");
+    const stopped = vi.fn();
+    watcher.on("engine.stopped", stopped);
+
+    engine.start();
+    engine.stop();
+
+    expect(stopped).toHaveBeenCalledOnce();
+    expect(stopped).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "engine.stopped", attempt: 0 })
+    );
+  });
+
+  it("empties the registry but keeps the stream open when unsubscribeAll() is called", () => {
+    const engine = new EventEngine({ network: "testnet" });
+    engine.subscribe("GABC");
+    engine.subscribe("GDEF");
+    engine.start();
+
+    const registry = (engine as unknown as { registry: Map<string, unknown> }).registry;
+    expect(registry.size).toBe(2);
+
+    engine.unsubscribeAll();
+
+    expect(registry.size).toBe(0);
+    expect(engine.status().running).toBe(true);
+    expect(streamInstances).toHaveLength(1);
   });
 
   it("returns null and warns when a required payment field is missing", () => {
@@ -259,13 +291,24 @@ describe("pulse-core EventEngine", () => {
   it("guards start() so duplicate live streams are not opened", () => {
     const engine = new EventEngine({ network: "testnet", logger: log });
 
-    engine.start();
-    engine.start();
+    const first = engine.start();
+    const second = engine.start();
 
+    expect(first).toBe(true);
+    expect(second).toBe(false);
     expect(streamInstances).toHaveLength(1);
     expect(log.warn).toHaveBeenCalledWith(
       "[pulse-core] EventEngine.start() called while the SSE stream is already active."
     );
+  });
+
+  it("start({ strict: true }) throws EngineAlreadyStartedError on duplicate start", () => {
+    const engine = new EventEngine({ network: "testnet" });
+
+    engine.start();
+
+    expect(() => engine.start({ strict: true })).toThrowError(EngineAlreadyStartedError);
+    expect(streamInstances).toHaveLength(1);
   });
 
   it("routes self-payments as payment.self exactly once", () => {
@@ -349,6 +392,125 @@ describe("pulse-core EventEngine", () => {
     latestStream().handlers.onerror(new Error("stream dropped after recovery"));
     expect(reconnecting).toHaveBeenLastCalledWith(
       expect.objectContaining({ type: "engine.reconnecting", attempt: 1 })
+    );
+  });
+
+  it("emits matching attempt numbers in reconnecting and reconnected events", () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    const engine = new EventEngine({
+      network: "testnet",
+      logger: log,
+      reconnect: {
+        initialDelayMs: 500,
+        maxDelayMs: 10000,
+      },
+    });
+
+    const watcher = engine.subscribe("GTEST");
+    const reconnecting = vi.fn();
+    const reconnected = vi.fn();
+    watcher.on("engine.reconnecting", reconnecting);
+    watcher.on("engine.reconnected", reconnected);
+
+    engine.start();
+
+    // Trigger first reconnect
+    latestStream().handlers.onerror(new Error("connection lost"));
+
+    expect(reconnecting).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "engine.reconnecting",
+        attempt: 1,
+        delayMs: 500,
+      })
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      "[pulse-core] SSE reconnect attempt 1 scheduled in 500ms."
+    );
+
+    // Advance timer to trigger reconnect
+    vi.advanceTimersByTime(500);
+
+    // Simulate successful reconnection with a message
+    latestStream().handlers.onmessage({
+      type: "payment",
+      to: "GTEST",
+      from: "GSRC",
+      amount: "5",
+      asset_type: "native",
+      created_at: "2026-04-28T12:00:00.000Z",
+    });
+
+    // Verify reconnected event has the same attempt number
+    expect(reconnected).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "engine.reconnected",
+        attempt: 1,
+      })
+    );
+    expect(log.info).toHaveBeenCalledWith(
+      "[pulse-core] SSE reconnect succeeded on attempt 1."
+    );
+  });
+
+  it("honors 429 Retry-After and emits engine.rate_limited", () => {
+    const engine = new EventEngine({ network: "testnet", logger: log });
+    const watcher = engine.subscribe("GABC");
+    const rateLimited = vi.fn();
+    const reconnecting = vi.fn();
+
+    watcher.on("engine.rate_limited", rateLimited);
+    watcher.on("engine.reconnecting", reconnecting);
+
+    engine.start();
+
+    latestStream().handlers.onerror({
+      status: 429,
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === "retry-after" ? "5" : null,
+      },
+    });
+
+    expect(rateLimited).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "engine.rate_limited",
+        attempt: 1,
+        delayMs: 5000,
+      })
+    );
+    expect(reconnecting).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      "[pulse-core] SSE rate limited by Horizon, reconnect scheduled in 5000ms."
+    );
+
+    vi.advanceTimersByTime(5000);
+    expect(streamInstances).toHaveLength(2);
+  });
+
+  it("backs off at least 60 seconds when Horizon returns 429 without Retry-After", () => {
+    const engine = new EventEngine({ network: "testnet", logger: log });
+    const watcher = engine.subscribe("GABC");
+    const rateLimited = vi.fn();
+
+    watcher.on("engine.rate_limited", rateLimited);
+
+    engine.start();
+
+    latestStream().handlers.onerror({
+      status: 429,
+      headers: { get: () => null },
+    });
+
+    expect(rateLimited).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "engine.rate_limited",
+        attempt: 1,
+        delayMs: 60000,
+      })
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      "[pulse-core] SSE rate limited by Horizon, reconnect scheduled in 60000ms."
     );
   });
 
@@ -643,6 +805,34 @@ describe("pulse-core EventEngine", () => {
         "[pulse-core] subscribe() called for address GDEST which already has an active watcher — filter option ignored."
       );
     });
+
+    it("includes the subscription name in lifecycle notifications and duplicate-subscribe warnings", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const watcher = engine.subscribe("GDEST", { name: "treasury-feed" });
+      const reconnecting = vi.fn();
+      watcher.on("engine.reconnecting", reconnecting);
+
+      engine.start();
+      latestStream().handlers.onerror(new Error("stream dropped"));
+
+      expect(reconnecting).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "engine.reconnecting",
+          name: "treasury-feed",
+          attempt: 1,
+        })
+      );
+
+      const duplicate = engine.subscribe("GDEST", {
+        name: "ignored",
+        filter: () => false,
+      });
+
+      expect(duplicate).toBe(watcher);
+      expect(log.warn).toHaveBeenCalledWith(
+        "[pulse-core] subscribe() called for treasury-feed (GDEST) which already has an active watcher — filter option ignored."
+      );
+    });
   });
 
   describe("create_account → account.created", () => {
@@ -747,6 +937,226 @@ describe("pulse-core EventEngine", () => {
       );
 
       expect(handler).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("manage_sell_offer / manage_buy_offer → offer.*", () => {
+    function makeOfferRecord(overrides: Record<string, unknown>): Record<string, unknown> {
+      return {
+        type: "manage_sell_offer",
+        source_account: "GSRC",
+        offer_id: "0",
+        amount: "100.0000000",
+        buying_asset_type: "native",
+        selling_asset_type: "credit_alphanum4",
+        selling_asset_code: "USDC",
+        selling_asset_issuer: "GISSUER",
+        price: "0.5",
+        created_at: "2026-04-28T14:00:00.000Z",
+        ...overrides,
+      };
+    }
+
+    it("emits offer.created when offer_id is 0 and amount > 0", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("offer.created", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeOfferRecord({ offer_id: "0", amount: "100" }));
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "offer.created",
+          offer_id: "0",
+          source: "GSRC",
+          buying_asset: "XLM",
+          selling_asset: "USDC:GISSUER",
+          amount: "100",
+        })
+      );
+    });
+
+    it("emits offer.updated when offer_id > 0 and amount > 0", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("offer.updated", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeOfferRecord({ offer_id: "12345", amount: "200" }));
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "offer.updated", offer_id: "12345", amount: "200" })
+      );
+    });
+
+    it("emits offer.deleted when amount is 0", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("offer.deleted", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeOfferRecord({ offer_id: "12345", amount: "0" }));
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "offer.deleted", offer_id: "12345", amount: "0" })
+      );
+    });
+
+    it("works for manage_buy_offer as well", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("offer.created", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(
+        makeOfferRecord({ type: "manage_buy_offer", offer_id: "0", amount: "50" })
+      );
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "offer.created", amount: "50" })
+      );
+    });
+  });
+
+  describe("bump_sequence → account.bump_sequence", () => {
+    it("emits account.bump_sequence with the new sequence number", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("account.bump_sequence", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage({
+        type: "bump_sequence",
+        source_account: "GSRC",
+        bump_to: "123456789",
+        created_at: "2026-04-28T14:00:00.000Z",
+      });
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "account.bump_sequence",
+          source: "GSRC",
+          bump_to: "123456789",
+          timestamp: "2026-04-28T14:00:00.000Z",
+        })
+      );
+    });
+
+    it("does not emit account.bump_sequence if source_account is missing", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("account.bump_sequence", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage({
+        type: "bump_sequence",
+        bump_to: "123456789",
+        created_at: "2026-04-28T14:00:00.000Z",
+        // missing source_account
+      });
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("manage_data → data.set / data.cleared", () => {
+    function makeManageDataRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+      return {
+        type: "manage_data",
+        source_account: "GSRC",
+        data_name: "federation",
+        data_value: "aGVsbG8=",
+        created_at: "2026-04-28T14:00:00.000Z",
+        ...overrides,
+      };
+    }
+
+    it("emits data.set when data_value is present", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("data.set", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeManageDataRecord());
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "data.set",
+          source: "GSRC",
+          name: "federation",
+          value: "aGVsbG8=",
+          timestamp: "2026-04-28T14:00:00.000Z",
+        })
+      );
+    });
+
+    it("emits data.cleared when data_value is null", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("data.cleared", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeManageDataRecord({ data_value: null }));
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "data.cleared", source: "GSRC", value: null })
+      );
+    });
+
+    it("emits data.cleared when data_value is absent", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("data.cleared", handler);
+
+      engine.start();
+      const record = makeManageDataRecord();
+      delete record.data_value;
+      latestStream().handlers.onmessage(record);
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: "data.cleared", value: null }));
+    });
+
+    it("does not emit if source_account is missing", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const watcher = engine.subscribe("GSRC");
+      const handler = vi.fn();
+      watcher.on("*", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeManageDataRecord({ source_account: "" }));
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("does not emit to unrelated watchers", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      engine.subscribe("GSRC");
+      const other = engine.subscribe("GOTHER");
+      const otherHandler = vi.fn();
+      other.on("*", otherHandler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeManageDataRecord());
+
+      expect(otherHandler).not.toHaveBeenCalled();
     });
   });
 
@@ -939,6 +1349,671 @@ describe("pulse-core EventEngine", () => {
       engine.stop();
 
       expect(engine.status()).toEqual({ running: false, watcherCount: 0, lastEventAt: null, reconnectAttempt: 0 });
+    });
+  });
+
+  describe("create_claimable_balance → claimable.created", () => {
+    function makeCreateClaimableRecord(
+      overrides: Record<string, unknown> = {}
+    ): Record<string, unknown> {
+      return {
+        type: "create_claimable_balance",
+        source_account: "GSPONSOR",
+        created_at: "2026-04-28T12:00:00.000Z",
+        amount: "100",
+        asset_type: "native",
+        balance_id: "00000000abc123",
+        claimants: [
+          { destination: "GCLAIMANT1", predicate: { unconditional: true } },
+        ],
+        ...overrides,
+      };
+    }
+
+    it("normalizes create_claimable_balance with native asset", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeCreateClaimableRecord());
+
+      expect(result).toEqual({
+        type: "claimable.created",
+        sponsor: "GSPONSOR",
+        balanceId: "00000000abc123",
+        claimants: [
+          { destination: "GCLAIMANT1", predicate: { unconditional: true } },
+        ],
+        asset: "XLM",
+        amount: "100",
+        timestamp: "2026-04-28T12:00:00.000Z",
+        raw: expect.any(Object),
+      });
+    });
+
+    it("normalizes create_claimable_balance with credit asset", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(
+        makeCreateClaimableRecord({
+          asset_type: "credit_alphanum4",
+          asset_code: "USDC",
+          asset_issuer: "GISSUER",
+        })
+      );
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          type: "claimable.created",
+          asset: "USDC:GISSUER",
+        })
+      );
+    });
+
+    it("routes claimable.created to each claimant watcher (fan-out)", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const w1 = engine.subscribe("GCLAIMANT1");
+      const w2 = engine.subscribe("GCLAIMANT2");
+      const w3 = engine.subscribe("GCLAIMANT3");
+      const h1 = vi.fn();
+      const h2 = vi.fn();
+      const h3 = vi.fn();
+      w1.on("claimable.created", h1);
+      w2.on("claimable.created", h2);
+      w3.on("claimable.created", h3);
+
+      engine.start();
+      latestStream().handlers.onmessage(
+        makeCreateClaimableRecord({
+          claimants: [
+            { destination: "GCLAIMANT1", predicate: { unconditional: true } },
+            { destination: "GCLAIMANT2", predicate: { unconditional: true } },
+          ],
+        })
+      );
+
+      expect(h1).toHaveBeenCalledOnce();
+      expect(h2).toHaveBeenCalledOnce();
+      expect(h3).not.toHaveBeenCalled();
+    });
+
+    it("routes claimable.created to the sponsor watcher", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const sponsorWatcher = engine.subscribe("GSPONSOR");
+      const handler = vi.fn();
+      sponsorWatcher.on("claimable.created", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeCreateClaimableRecord());
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "claimable.created", sponsor: "GSPONSOR" })
+      );
+    });
+
+    it("does not emit duplicate to sponsor when sponsor is also a claimant", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSPONSOR");
+      const handler = vi.fn();
+      watcher.on("claimable.created", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(
+        makeCreateClaimableRecord({
+          claimants: [
+            { destination: "GSPONSOR", predicate: { unconditional: true } },
+          ],
+        })
+      );
+
+      expect(handler).toHaveBeenCalledOnce();
+    });
+
+    it("does not route to unrelated watchers", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const unrelated = engine.subscribe("GUNRELATED");
+      const handler = vi.fn();
+      unrelated.on("claimable.created", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeCreateClaimableRecord());
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("drops record and warns when a required string field is missing", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeCreateClaimableRecord({ balance_id: undefined }));
+
+      expect(result).toBeNull();
+      expect(log.warn).toHaveBeenCalledWith(
+        '[pulse-core] normalize() dropping create_claimable_balance record: field "balance_id" is missing or not a non-empty string.',
+        expect.objectContaining({ record: expect.any(Object) })
+      );
+    });
+
+    it("drops record and warns when claimants array is missing", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeCreateClaimableRecord({ claimants: undefined }));
+
+      expect(result).toBeNull();
+      expect(log.warn).toHaveBeenCalledWith(
+        '[pulse-core] normalize() dropping create_claimable_balance record: field "claimants" is missing or invalid.',
+        expect.objectContaining({ record: expect.any(Object) })
+      );
+    });
+
+    it("drops record when claimants array is empty", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeCreateClaimableRecord({ claimants: [] }));
+
+      expect(result).toBeNull();
+    });
+
+    it("emits to the wildcard listener alongside claimable.created", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GCLAIMANT1");
+      const specific = vi.fn();
+      const wildcard = vi.fn();
+      watcher.on("claimable.created", specific);
+      watcher.on("*", wildcard);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeCreateClaimableRecord());
+
+      expect(specific).toHaveBeenCalledOnce();
+      expect(wildcard).toHaveBeenCalledOnce();
+      expect(wildcard).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "claimable.created" })
+      );
+    });
+  });
+
+  describe("claim_claimable_balance → claimable.claimed", () => {
+    function makeClaimClaimableRecord(
+      overrides: Record<string, unknown> = {}
+    ): Record<string, unknown> {
+      return {
+        type: "claim_claimable_balance",
+        source_account: "GCLAIMANT",
+        created_at: "2026-04-28T13:00:00.000Z",
+        balance_id: "00000000abc123",
+        ...overrides,
+      };
+    }
+
+    it("normalizes claim_claimable_balance correctly", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeClaimClaimableRecord());
+
+      expect(result).toEqual({
+        type: "claimable.claimed",
+        claimant: "GCLAIMANT",
+        balanceId: "00000000abc123",
+        timestamp: "2026-04-28T13:00:00.000Z",
+        raw: expect.any(Object),
+      });
+    });
+
+    it("routes claimable.claimed to the claimant watcher", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GCLAIMANT");
+      const handler = vi.fn();
+      watcher.on("claimable.claimed", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeClaimClaimableRecord());
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "claimable.claimed",
+          claimant: "GCLAIMANT",
+          balanceId: "00000000abc123",
+        })
+      );
+    });
+
+    it("does not route to unrelated watchers", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const unrelated = engine.subscribe("GUNRELATED");
+      const handler = vi.fn();
+      unrelated.on("claimable.claimed", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeClaimClaimableRecord());
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("drops record and warns when a required field is missing", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const missingFieldCases: Array<[string, Record<string, unknown>]> = [
+        ["source_account", makeClaimClaimableRecord({ source_account: undefined })],
+        ["created_at", makeClaimClaimableRecord({ created_at: undefined })],
+        ["balance_id", makeClaimClaimableRecord({ balance_id: undefined })],
+      ];
+
+      for (const [field, record] of missingFieldCases) {
+        vi.clearAllMocks();
+        const result = normalize(record);
+        expect(result).toBeNull();
+        expect(log.warn).toHaveBeenCalledWith(
+          `[pulse-core] normalize() dropping claim_claimable_balance record: field "${field}" is missing or not a non-empty string.`,
+          expect.objectContaining({ record: expect.any(Object) })
+        );
+      }
+    });
+
+    it("emits to the wildcard listener alongside claimable.claimed", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GCLAIMANT");
+      const specific = vi.fn();
+      const wildcard = vi.fn();
+      watcher.on("claimable.claimed", specific);
+      watcher.on("*", wildcard);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeClaimClaimableRecord());
+
+      expect(specific).toHaveBeenCalledOnce();
+      expect(wildcard).toHaveBeenCalledOnce();
+      expect(wildcard).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "claimable.claimed" })
+      );
+    });
+  });
+
+  describe("liquidity_pool_deposit → lp.deposited", () => {
+    function makeLPDepositRecord(
+      overrides: Record<string, unknown> = {}
+    ): Record<string, unknown> {
+      return {
+        type: "liquidity_pool_deposit",
+        source_account: "GSRC",
+        created_at: "2026-04-30T10:00:00.000Z",
+        liquidity_pool_id: "pool123",
+        reserves_deposited: [
+          { asset: "XLM", amount: "1000.0000000" },
+          { asset: "USDC:GISSUER", amount: "500.0000000" },
+        ],
+        shares_received: "700.0000000",
+        ...overrides,
+      };
+    }
+
+    it("normalizes liquidity_pool_deposit correctly", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeLPDepositRecord());
+
+      expect(result).toEqual({
+        type: "lp.deposited",
+        source: "GSRC",
+        pool_id: "pool123",
+        reserves_deposited: [
+          { asset: "XLM", amount: "1000.0000000" },
+          { asset: "USDC:GISSUER", amount: "500.0000000" },
+        ],
+        shares_received: "700.0000000",
+        timestamp: "2026-04-30T10:00:00.000Z",
+        raw: expect.any(Object),
+      });
+    });
+
+    it("routes lp.deposited to the source watcher and wildcard", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const specific = vi.fn();
+      const wildcard = vi.fn();
+      watcher.on("lp.deposited", specific);
+      watcher.on("*", wildcard);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeLPDepositRecord());
+
+      expect(specific).toHaveBeenCalledOnce();
+      expect(specific).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "lp.deposited", source: "GSRC", pool_id: "pool123" })
+      );
+      expect(wildcard).toHaveBeenCalledOnce();
+    });
+
+    it("does not route to unrelated watchers", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const unrelated = engine.subscribe("GUNRELATED");
+      const handler = vi.fn();
+      unrelated.on("lp.deposited", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeLPDepositRecord());
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("drops record and warns when a required field is missing", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeLPDepositRecord({ liquidity_pool_id: undefined }));
+
+      expect(result).toBeNull();
+      expect(log.warn).toHaveBeenCalledWith(
+        '[pulse-core] normalize() dropping liquidity_pool_deposit record: field "liquidity_pool_id" is missing.',
+        expect.objectContaining({ record: expect.any(Object) })
+      );
+    });
+
+    it("drops record and warns when reserves_deposited is not an array", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeLPDepositRecord({ reserves_deposited: "invalid" }));
+
+      expect(result).toBeNull();
+      expect(log.warn).toHaveBeenCalledWith(
+        "[pulse-core] normalize() dropping liquidity_pool_deposit record: reserves_deposited is not an array.",
+        expect.objectContaining({ record: expect.any(Object) })
+      );
+    });
+  });
+
+  describe("liquidity_pool_withdraw → lp.withdrawn", () => {
+    function makeLPWithdrawRecord(
+      overrides: Record<string, unknown> = {}
+    ): Record<string, unknown> {
+      return {
+        type: "liquidity_pool_withdraw",
+        source_account: "GSRC",
+        created_at: "2026-04-30T11:00:00.000Z",
+        liquidity_pool_id: "pool123",
+        reserves_received: [
+          { asset: "XLM", amount: "900.0000000" },
+          { asset: "USDC:GISSUER", amount: "450.0000000" },
+        ],
+        shares: "600.0000000",
+        ...overrides,
+      };
+    }
+
+    it("normalizes liquidity_pool_withdraw correctly", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeLPWithdrawRecord());
+
+      expect(result).toEqual({
+        type: "lp.withdrawn",
+        source: "GSRC",
+        pool_id: "pool123",
+        reserves_received: [
+          { asset: "XLM", amount: "900.0000000" },
+          { asset: "USDC:GISSUER", amount: "450.0000000" },
+        ],
+        shares_redeemed: "600.0000000",
+        timestamp: "2026-04-30T11:00:00.000Z",
+        raw: expect.any(Object),
+      });
+    });
+
+    it("routes lp.withdrawn to the source watcher and wildcard", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const watcher = engine.subscribe("GSRC");
+      const specific = vi.fn();
+      const wildcard = vi.fn();
+      watcher.on("lp.withdrawn", specific);
+      watcher.on("*", wildcard);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeLPWithdrawRecord());
+
+      expect(specific).toHaveBeenCalledOnce();
+      expect(wildcard).toHaveBeenCalledOnce();
+    });
+
+    it("drops record and warns when shares field is missing", () => {
+      const engine = new EventEngine({ network: "testnet", logger: log });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeLPWithdrawRecord({ shares: undefined }));
+
+      expect(result).toBeNull();
+      expect(log.warn).toHaveBeenCalledWith(
+        '[pulse-core] normalize() dropping liquidity_pool_withdraw record: field "shares" is missing.',
+        expect.objectContaining({ record: expect.any(Object) })
+      );
+    });
+  });
+
+  describe("allow_trust → trustline.authorized / trustline.deauthorized", () => {
+    function makeAllowTrustRecord(
+      overrides: Record<string, unknown> = {}
+    ): Record<string, unknown> {
+      return {
+        type: "allow_trust",
+        source_account: "GISSUER",
+        trustor: "GTRUSTEE",
+        trustee: "GISSUER",
+        asset_type: "credit_alphanum4",
+        asset_code: "USDC",
+        asset_issuer: "GISSUER",
+        authorize: true,
+        created_at: "2026-05-01T10:00:00.000Z",
+        ...overrides,
+      };
+    }
+
+    it("normalizes allow_trust as trustline.authorized when authorize is true", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeAllowTrustRecord());
+
+      expect(result).toEqual({
+        type: "trustline.authorized",
+        trustor: "GTRUSTEE",
+        issuer: "GISSUER",
+        asset: "USDC:GISSUER",
+        timestamp: "2026-05-01T10:00:00.000Z",
+        operation: "allow_trust",
+        raw: expect.any(Object),
+      });
+    });
+
+    it("normalizes allow_trust as trustline.deauthorized when authorize is false", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeAllowTrustRecord({ authorize: false }));
+
+      expect(result).toEqual(expect.objectContaining({ type: "trustline.deauthorized" }));
+    });
+
+    it("routes trustline.authorized to both issuer and trustor watchers", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const issuerW = engine.subscribe("GISSUER");
+      const trustorW = engine.subscribe("GTRUSTEE");
+      const issuerH = vi.fn();
+      const trustorH = vi.fn();
+      issuerW.on("trustline.authorized", issuerH);
+      trustorW.on("trustline.authorized", trustorH);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeAllowTrustRecord());
+
+      expect(issuerH).toHaveBeenCalledOnce();
+      expect(trustorH).toHaveBeenCalledOnce();
+    });
+
+    it("does not route to unrelated watchers", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const unrelated = engine.subscribe("GUNRELATED");
+      const handler = vi.fn();
+      unrelated.on("trustline.authorized", handler);
+
+      engine.start();
+      latestStream().handlers.onmessage(makeAllowTrustRecord());
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("drops record when authorize field is not boolean", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeAllowTrustRecord({ authorize: "yes" }));
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("set_trust_line_flags → trustline.authorized / trustline.deauthorized", () => {
+    function makeSTLFRecord(
+      overrides: Record<string, unknown> = {}
+    ): Record<string, unknown> {
+      return {
+        type: "set_trust_line_flags",
+        source_account: "GISSUER",
+        trustor: "GTRUSTEE",
+        asset_type: "credit_alphanum4",
+        asset_code: "USDC",
+        asset_issuer: "GISSUER",
+        set_flags_s: ["authorized"],
+        clear_flags_s: [],
+        created_at: "2026-05-01T11:00:00.000Z",
+        ...overrides,
+      };
+    }
+
+    it("normalizes set_trust_line_flags as trustline.authorized when setting authorized flag", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeSTLFRecord());
+
+      expect(result).toEqual({
+        type: "trustline.authorized",
+        trustor: "GTRUSTEE",
+        issuer: "GISSUER",
+        asset: "USDC:GISSUER",
+        timestamp: "2026-05-01T11:00:00.000Z",
+        operation: "set_trust_line_flags",
+        raw: expect.any(Object),
+      });
+    });
+
+    it("normalizes set_trust_line_flags as trustline.deauthorized when clearing authorized flag", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeSTLFRecord({ set_flags_s: [], clear_flags_s: ["authorized"] }));
+
+      expect(result).toEqual(expect.objectContaining({ type: "trustline.deauthorized" }));
+    });
+
+    it("returns null when both set and clear include authorized (ambiguous)", () => {
+      const engine = new EventEngine({ network: "testnet" });
+      const normalize = (
+        engine as unknown as { normalize(record: unknown): unknown }
+      ).normalize.bind(engine);
+
+      const result = normalize(makeSTLFRecord({ set_flags_s: ["authorized"], clear_flags_s: ["authorized"] }));
+
+      expect(result).toBeNull();
+    });
+  });
+
+  it("reports per-source status and preserves flat fields for compatibility", () => {
+    const engine = new EventEngine({ network: "testnet" });
+
+    expect(engine.status()).toEqual({
+      running: false,
+      watcherCount: 0,
+      lastEventAt: null,
+      reconnectAttempt: 0,
+      sources: {
+        horizon: {
+          running: false,
+          lastEventAt: null,
+          reconnectAttempt: 0,
+          cursor: undefined,
+        },
+        soroban: {
+          running: false,
+          lastEventAt: null,
+          reconnectAttempt: 0,
+        },
+      },
+    });
+
+    engine.start();
+
+    expect(engine.status().running).toBe(true);
+    expect(engine.status().sources.horizon.running).toBe(true);
+    expect(engine.status().sources.soroban.running).toBe(false);
+
+    latestStream().handlers.onmessage({
+      type: "payment",
+      to: "GABC",
+      from: "GSRC",
+      amount: "10",
+      asset_type: "native",
+      created_at: "2026-03-26T20:00:00.000Z",
+    });
+
+    expect(engine.status()).toMatchObject({
+      lastEventAt: "2026-03-26T20:00:00.000Z",
+      sources: {
+        horizon: {
+          lastEventAt: "2026-03-26T20:00:00.000Z",
+        },
+      },
     });
   });
 });
